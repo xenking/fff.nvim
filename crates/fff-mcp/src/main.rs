@@ -12,14 +12,25 @@ mod output;
 mod server;
 mod update_check;
 
-use clap::Parser;
+use axum::routing::get;
+use clap::{Parser, ValueEnum};
 use fff::file_picker::FilePicker;
 use fff::frecency::FrecencyTracker;
 use fff::{FFFMode, SharedFilePicker, SharedFrecency};
 use git2::Repository;
 use mimalloc::MiMalloc;
-use rmcp::{ServiceExt, transport::stdio};
+use rmcp::{
+    ServiceExt,
+    transport::{
+        stdio,
+        streamable_http_server::{
+            StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+        },
+    },
+};
 use server::FffServer;
+use std::net::SocketAddr;
+use tokio_util::sync::CancellationToken;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -100,6 +111,15 @@ pub const MCP_INSTRUCTIONS: &str = concat!(
     "  !generated/ - exclude generated code",
 );
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum McpTransport {
+    /// Serve MCP over stdio. This is the default for compatibility with all MCP clients.
+    Stdio,
+    /// Serve MCP over Streamable HTTP. Useful for long-lived clients that handle stdio
+    /// MCP process restarts poorly.
+    StreamableHttp,
+}
+
 /// FFF MCP Server — high-performance file finder for AI code assistants.
 #[derive(Parser)]
 #[command(name = "fff-mcp", version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("FFF_GIT_HASH"), ")"))]
@@ -138,6 +158,7 @@ pub(crate) struct Args {
 
     /// Disable the content index built after the initial scan.
     /// This makes grep calls slower but consumes less RAM (recommended to not turn off)
+    #[arg(long = "no-content-indexing")]
     no_content_indexing: bool,
 
     /// Explicitly enable content indexing even when `--no-warmup` is set.
@@ -149,12 +170,39 @@ pub(crate) struct Args {
     #[arg(long = "no-watch")]
     no_watch: bool,
 
+    /// Re-scan the indexed tree periodically instead of relying on OS-level
+    /// file-system watches. This is useful for broad roots on macOS where
+    /// live watchers can consume thousands of file descriptors.
+    #[arg(long = "poll-interval-secs", env = "FFF_POLL_INTERVAL_SECS")]
+    poll_interval_secs: Option<u64>,
+
     /// Maximum number of files whose content is kept persistently in memory.
     /// Files beyond this limit are still searchable via temporary mmaps that
     /// are released after each grep. Defaults to 30 000.
     /// Also settable via the FFF_MAX_CACHED_FILES environment variable.
     #[arg(long = "max-cached-files", env = "FFF_MAX_CACHED_FILES")]
     max_cached_files: Option<usize>,
+
+    /// MCP transport to use.
+    #[arg(
+        long = "transport",
+        env = "FFF_MCP_TRANSPORT",
+        value_enum,
+        default_value_t = McpTransport::Stdio
+    )]
+    transport: McpTransport,
+
+    /// Address used by Streamable HTTP mode.
+    #[arg(
+        long = "http-bind",
+        env = "FFF_MCP_HTTP_BIND",
+        default_value = "127.0.0.1:8761"
+    )]
+    http_bind: String,
+
+    /// HTTP path for Streamable HTTP mode.
+    #[arg(long = "http-path", env = "FFF_MCP_HTTP_PATH", default_value = "/mcp")]
+    http_path: String,
 
     /// Run a health check and print diagnostic information, then exit.
     #[arg(long = "healthcheck")]
@@ -189,6 +237,339 @@ fn dirs_home() -> String {
     std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_else(|_| "/tmp".to_string())
+}
+
+fn spawn_periodic_rescan(
+    shared_picker: SharedFilePicker,
+    shared_frecency: SharedFrecency,
+    interval_secs: u64,
+) {
+    tokio::task::spawn_blocking(move || {
+        let interval = std::time::Duration::from_secs(interval_secs);
+        tracing::info!(
+            interval_secs,
+            "Periodic filesystem rescan enabled for fff-mcp"
+        );
+
+        loop {
+            std::thread::sleep(interval);
+
+            let started = std::time::Instant::now();
+            match shared_picker.trigger_full_rescan_async(&shared_frecency) {
+                Ok(()) => {
+                    shared_picker.wait_for_scan(interval);
+                    tracing::info!(
+                        elapsed = ?started.elapsed(),
+                        "Periodic filesystem rescan requested"
+                    );
+                }
+                Err(error) => tracing::error!(?error, "Periodic filesystem rescan failed"),
+            }
+        }
+    });
+}
+
+fn normalize_http_path(path: &str) -> String {
+    if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    }
+}
+
+async fn health() -> &'static str {
+    "ok"
+}
+
+fn build_streamable_http_router(
+    shared_picker: SharedFilePicker,
+    shared_frecency: SharedFrecency,
+    path: &str,
+    cancellation_token: CancellationToken,
+) -> axum::Router {
+    let http_path = normalize_http_path(path);
+    let picker_for_factory = shared_picker.clone();
+    let frecency_for_factory = shared_frecency.clone();
+    let service: StreamableHttpService<FffServer, LocalSessionManager> = StreamableHttpService::new(
+        move || {
+            Ok(FffServer::new(
+                picker_for_factory.clone(),
+                frecency_for_factory.clone(),
+            ))
+        },
+        Default::default(),
+        StreamableHttpServerConfig {
+            sse_keep_alive: None,
+            cancellation_token,
+            ..Default::default()
+        },
+    );
+
+    axum::Router::new()
+        .nest_service(&http_path, service)
+        .route("/health", get(health))
+}
+
+async fn serve_streamable_http(
+    shared_picker: SharedFilePicker,
+    shared_frecency: SharedFrecency,
+    bind: &str,
+    path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let addr: SocketAddr = bind.parse()?;
+    let http_path = normalize_http_path(path);
+    let cancellation_token = CancellationToken::new();
+    let router = build_streamable_http_router(
+        shared_picker,
+        shared_frecency,
+        &http_path,
+        cancellation_token.child_token(),
+    );
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let local_addr = listener.local_addr()?;
+    tracing::info!(%local_addr, path = %http_path, "FFF MCP Streamable HTTP server listening");
+
+    axum::serve(listener, router)
+        .with_graceful_shutdown(async move {
+            tokio::signal::ctrl_c().await.ok();
+            cancellation_token.cancel();
+        })
+        .await?;
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn make_temp_repo() -> std::path::PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before UNIX_EPOCH")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("fff-mcp-http-test-{unique}"));
+        std::fs::create_dir_all(path.join("src")).expect("create temp test repo");
+        std::fs::write(path.join("README.md"), "# fff test\n").expect("write README");
+        std::fs::write(path.join("src").join("main.rs"), "fn main() {}\n")
+            .expect("write source file");
+        path
+    }
+
+    async fn post_mcp(
+        addr: SocketAddr,
+        path: &str,
+        session_id: Option<&str>,
+        body: &str,
+        expected_body_fragment: &str,
+    ) -> (Vec<(String, String)>, String) {
+        let mut stream = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connect test HTTP server");
+        let session_header = session_id
+            .map(|id| format!("Mcp-Session-Id: {id}\r\n"))
+            .unwrap_or_default();
+        let request = format!(
+            "POST {path} HTTP/1.1\r\n\
+             Host: {addr}\r\n\
+             Content-Type: application/json\r\n\
+             Accept: application/json, text/event-stream\r\n\
+             Connection: close\r\n\
+             {session_header}\
+             Content-Length: {}\r\n\
+             \r\n\
+             {body}",
+            body.len()
+        );
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("write HTTP request");
+
+        let mut response = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(
+                remaining.min(Duration::from_millis(100)),
+                stream.read(&mut chunk),
+            )
+            .await
+            {
+                Ok(Ok(0)) => break,
+                Ok(Ok(n)) => {
+                    response.extend_from_slice(&chunk[..n]);
+                    if !expected_body_fragment.is_empty()
+                        && String::from_utf8_lossy(&response).contains(expected_body_fragment)
+                    {
+                        break;
+                    }
+                }
+                Ok(Err(error)) => panic!("read HTTP response: {error}"),
+                Err(_)
+                    if !expected_body_fragment.is_empty()
+                        && String::from_utf8_lossy(&response).contains(expected_body_fragment) =>
+                {
+                    break;
+                }
+                Err(_) => continue,
+            }
+        }
+
+        let response = String::from_utf8(response).expect("HTTP response is UTF-8");
+        assert!(
+            response.starts_with("HTTP/1.1 200") || response.starts_with("HTTP/1.1 202"),
+            "unexpected HTTP response: {response}"
+        );
+        if !expected_body_fragment.is_empty() {
+            assert!(
+                response.contains(expected_body_fragment),
+                "response did not contain {expected_body_fragment:?}: {response}"
+            );
+        }
+
+        let (head, body) = response
+            .split_once("\r\n\r\n")
+            .map_or((response.as_str(), ""), |(head, body)| (head, body));
+        let headers = head
+            .lines()
+            .skip(1)
+            .filter_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                Some((name.trim().to_ascii_lowercase(), value.trim().to_string()))
+            })
+            .collect();
+
+        (headers, body.to_string())
+    }
+
+    fn create_test_picker(base_path: &std::path::Path) -> (SharedPicker, SharedFrecency) {
+        let shared_picker = SharedPicker::default();
+        let shared_frecency = SharedFrecency::default();
+        FilePicker::new_with_shared_state(
+            shared_picker.clone(),
+            shared_frecency.clone(),
+            fff::FilePickerOptions {
+                base_path: base_path.to_string_lossy().to_string(),
+                enable_mmap_cache: false,
+                enable_content_indexing: false,
+                watch: false,
+                mode: FFFMode::Ai,
+                cache_budget: None,
+            },
+        )
+        .expect("init file picker");
+        assert!(
+            shared_picker.wait_for_scan(Duration::from_secs(5)),
+            "initial test scan did not finish"
+        );
+        (shared_picker, shared_frecency)
+    }
+
+    #[test]
+    fn parses_streamable_http_transport_flags() {
+        let args = Args::try_parse_from([
+            "fff-mcp",
+            "--transport",
+            "streamable-http",
+            "--http-bind",
+            "127.0.0.1:9999",
+            "--http-path",
+            "mcp",
+        ])
+        .expect("parse streamable HTTP args");
+
+        assert_eq!(args.transport, McpTransport::StreamableHttp);
+        assert_eq!(args.http_bind, "127.0.0.1:9999");
+        assert_eq!(normalize_http_path(&args.http_path), "/mcp");
+    }
+
+    #[tokio::test]
+    async fn streamable_http_serves_find_files() {
+        let temp_repo = make_temp_repo();
+        let (shared_picker, shared_frecency) = create_test_picker(&temp_repo);
+        let cancellation_token = CancellationToken::new();
+        let router = build_streamable_http_router(
+            shared_picker,
+            shared_frecency,
+            "/mcp",
+            cancellation_token.child_token(),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("get test listener addr");
+        let server = tokio::spawn({
+            let cancellation_token = cancellation_token.clone();
+            async move {
+                axum::serve(listener, router)
+                    .with_graceful_shutdown(async move {
+                        cancellation_token.cancelled_owned().await;
+                    })
+                    .await
+                    .expect("serve streamable HTTP test server");
+            }
+        });
+
+        let init = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": { "name": "fff-mcp-test", "version": "1.0" }
+            }
+        })
+        .to_string();
+        let (headers, init_body) = post_mcp(addr, "/mcp", None, &init, "serverInfo").await;
+        assert!(
+            init_body.contains("fff"),
+            "initialize response did not include fff server info: {init_body}"
+        );
+        let session_id = headers
+            .iter()
+            .find_map(|(name, value)| (name == "mcp-session-id").then(|| value.clone()))
+            .expect("initialize response includes Mcp-Session-Id");
+
+        let initialized = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+            "params": {}
+        })
+        .to_string();
+        let _ = post_mcp(addr, "/mcp", Some(&session_id), &initialized, "").await;
+
+        let call = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "find_files",
+                "arguments": {
+                    "query": "README",
+                    "maxResults": 5
+                }
+            }
+        })
+        .to_string();
+        let (_headers, body) = post_mcp(addr, "/mcp", Some(&session_id), &call, "README.md").await;
+        assert!(
+            body.contains("\"isError\":false") || !body.contains("\"isError\":true"),
+            "find_files returned an MCP error: {body}"
+        );
+
+        cancellation_token.cancel();
+        server.await.expect("join test server");
+        std::fs::remove_dir_all(temp_repo).ok();
+    }
 }
 
 #[tokio::main]
@@ -278,6 +659,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         update_check::spawn_update_check();
     }
 
+    if let Some(interval_secs) = args.poll_interval_secs.filter(|interval| *interval > 0) {
+        spawn_periodic_rescan(
+            shared_picker.clone(),
+            shared_frecency.clone(),
+            interval_secs,
+        );
+    }
+
     // Create and start the MCP server
     let server = FffServer::new(shared_picker.clone(), shared_frecency.clone());
 
@@ -300,23 +689,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let service = server
-        .serve(stdio())
-        .await
-        .map_err(|e| format!("Failed to start MCP server: {}", e))?;
+    if args.transport == McpTransport::StreamableHttp {
+        serve_streamable_http(
+            shared_picker.clone(),
+            shared_frecency.clone(),
+            &args.http_bind,
+            &args.http_path,
+        )
+        .await?;
+    } else {
+        let service = server
+            .serve(stdio())
+            .await
+            .map_err(|e| format!("Failed to start MCP server: {}", e))?;
 
-    let picker_for_shutdown = shared_picker.clone();
-    tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
-        if let Ok(mut guard) = picker_for_shutdown.write()
-            && let Some(ref mut picker) = *guard
-        {
-            picker.stop_background_monitor();
-        }
-        std::process::exit(0);
-    });
+        let picker_for_shutdown = shared_picker.clone();
+        tokio::spawn(async move {
+            tokio::signal::ctrl_c().await.ok();
+            if let Ok(mut guard) = picker_for_shutdown.write()
+                && let Some(ref mut picker) = *guard
+            {
+                picker.stop_background_monitor();
+            }
+            std::process::exit(0);
+        });
 
-    service.waiting().await?;
+        service.waiting().await?;
+    }
 
     if let Ok(mut guard) = shared_picker.write()
         && let Some(ref mut picker) = *guard
