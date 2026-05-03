@@ -95,5 +95,4 @@ jobs:
           gh release delete "$tag" --cleanup-tag --yes >/dev/null 2>&1 || true
           gh release create "$tag" dist/* \
             --title "fff ${tag}" \
-            --notes "Automated binary release for ${GITHUB_SHA}." \
-            --prerelease
+            --notes "Automated binary release for ${GITHUB_SHA}."
