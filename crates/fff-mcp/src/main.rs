@@ -12,7 +12,12 @@ mod output;
 mod server;
 mod update_check;
 
-use axum::routing::get;
+use axum::{
+    Json,
+    extract::State,
+    http::StatusCode,
+    routing::{get, post},
+};
 use clap::{Parser, ValueEnum};
 use fff::file_picker::FilePicker;
 use fff::frecency::FrecencyTracker;
@@ -204,6 +209,10 @@ pub(crate) struct Args {
     #[arg(long = "http-path", env = "FFF_MCP_HTTP_PATH", default_value = "/mcp")]
     http_path: String,
 
+    /// Write streamable HTTP sidecar metadata to this path after binding.
+    #[arg(long = "registry-path", env = "FFF_MCP_REGISTRY_PATH")]
+    registry_path: Option<String>,
+
     /// Run a health check and print diagnostic information, then exit.
     #[arg(long = "healthcheck")]
     pub(crate) healthcheck: bool,
@@ -288,9 +297,209 @@ async fn health() -> &'static str {
     "ok"
 }
 
+#[derive(Clone)]
+struct FffqState {
+    server: FffServer,
+    root: String,
+}
+
+#[derive(serde::Serialize)]
+struct FffqHealth {
+    ok: bool,
+    root: String,
+    pid: u32,
+    version: &'static str,
+}
+
+#[derive(serde::Serialize)]
+struct FffqTextResponse {
+    text: String,
+}
+
+#[derive(serde::Serialize)]
+struct FffqError {
+    error: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "tool", rename_all = "snake_case")]
+enum FffqBatchOp {
+    FindFiles(server::FindFilesParams),
+    Grep(server::GrepParams),
+    MultiGrep(server::MultiGrepParams),
+}
+
+#[derive(serde::Deserialize)]
+struct FffqBatchRequest {
+    ops: Vec<FffqBatchOp>,
+}
+
+#[derive(serde::Serialize)]
+struct FffqBatchItem {
+    ok: bool,
+    tool: &'static str,
+    text: String,
+}
+
+#[derive(serde::Serialize)]
+struct FffqBatchResponse {
+    results: Vec<FffqBatchItem>,
+}
+
+#[derive(serde::Serialize)]
+struct SidecarRegistry {
+    root: String,
+    pid: u32,
+    http_url: String,
+    mcp_url: String,
+    fffq_url: String,
+    started_at_ms: u128,
+}
+
+fn fffq_error(error: rmcp::model::ErrorData) -> (StatusCode, Json<FffqError>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(FffqError {
+            error: error.message.into_owned(),
+        }),
+    )
+}
+
+async fn fffq_health(State(state): State<FffqState>) -> Json<FffqHealth> {
+    Json(FffqHealth {
+        ok: true,
+        root: state.root,
+        pid: std::process::id(),
+        version: env!("CARGO_PKG_VERSION"),
+    })
+}
+
+async fn fffq_find(
+    State(state): State<FffqState>,
+    Json(params): Json<server::FindFilesParams>,
+) -> Result<Json<FffqTextResponse>, (StatusCode, Json<FffqError>)> {
+    state
+        .server
+        .find_files_text(params)
+        .map(|text| Json(FffqTextResponse { text }))
+        .map_err(fffq_error)
+}
+
+async fn fffq_grep(
+    State(state): State<FffqState>,
+    Json(params): Json<server::GrepParams>,
+) -> Result<Json<FffqTextResponse>, (StatusCode, Json<FffqError>)> {
+    state
+        .server
+        .grep_text(params)
+        .map(|text| Json(FffqTextResponse { text }))
+        .map_err(fffq_error)
+}
+
+async fn fffq_multi_grep(
+    State(state): State<FffqState>,
+    Json(params): Json<server::MultiGrepParams>,
+) -> Result<Json<FffqTextResponse>, (StatusCode, Json<FffqError>)> {
+    state
+        .server
+        .multi_grep_text(params)
+        .map(|text| Json(FffqTextResponse { text }))
+        .map_err(fffq_error)
+}
+
+async fn fffq_batch(
+    State(state): State<FffqState>,
+    Json(request): Json<FffqBatchRequest>,
+) -> Json<FffqBatchResponse> {
+    let results = request
+        .ops
+        .into_iter()
+        .map(|op| match op {
+            FffqBatchOp::FindFiles(params) => match state.server.find_files_text(params) {
+                Ok(text) => FffqBatchItem {
+                    ok: true,
+                    tool: "find_files",
+                    text,
+                },
+                Err(error) => FffqBatchItem {
+                    ok: false,
+                    tool: "find_files",
+                    text: error.message.into_owned(),
+                },
+            },
+            FffqBatchOp::Grep(params) => match state.server.grep_text(params) {
+                Ok(text) => FffqBatchItem {
+                    ok: true,
+                    tool: "grep",
+                    text,
+                },
+                Err(error) => FffqBatchItem {
+                    ok: false,
+                    tool: "grep",
+                    text: error.message.into_owned(),
+                },
+            },
+            FffqBatchOp::MultiGrep(params) => match state.server.multi_grep_text(params) {
+                Ok(text) => FffqBatchItem {
+                    ok: true,
+                    tool: "multi_grep",
+                    text,
+                },
+                Err(error) => FffqBatchItem {
+                    ok: false,
+                    tool: "multi_grep",
+                    text: error.message.into_owned(),
+                },
+            },
+        })
+        .collect();
+
+    Json(FffqBatchResponse { results })
+}
+
+fn sidecar_hash(root: &str) -> String {
+    blake3::hash(root.as_bytes()).to_hex()[..16].to_string()
+}
+
+fn default_registry_path(root: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(dirs_home())
+        .join(".cache")
+        .join("fff")
+        .join("sidecars")
+        .join(format!("{}.json", sidecar_hash(root)))
+}
+
+fn write_sidecar_registry(
+    path: Option<&str>,
+    root: &str,
+    local_addr: SocketAddr,
+    http_path: &str,
+) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    let registry_path = path
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| default_registry_path(root));
+    if let Some(parent) = registry_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let http_url = format!("http://{local_addr}");
+    let registry = SidecarRegistry {
+        root: root.to_string(),
+        pid: std::process::id(),
+        mcp_url: format!("{http_url}{http_path}"),
+        fffq_url: format!("{http_url}/fffq"),
+        http_url,
+        started_at_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis(),
+    };
+    std::fs::write(&registry_path, serde_json::to_vec_pretty(&registry)?)?;
+    Ok(registry_path)
+}
+
 fn build_streamable_http_router(
     shared_picker: SharedPicker,
     shared_frecency: SharedFrecency,
+    root: &str,
     path: &str,
     cancellation_token: CancellationToken,
 ) -> axum::Router {
@@ -312,16 +521,29 @@ fn build_streamable_http_router(
         },
     );
 
+    let sidecar_state = FffqState {
+        server: FffServer::new(shared_picker, shared_frecency),
+        root: root.to_string(),
+    };
+
     axum::Router::new()
         .nest_service(&http_path, service)
         .route("/health", get(health))
+        .route("/fffq/health", get(fffq_health))
+        .route("/fffq/find", post(fffq_find))
+        .route("/fffq/grep", post(fffq_grep))
+        .route("/fffq/multi-grep", post(fffq_multi_grep))
+        .route("/fffq/batch", post(fffq_batch))
+        .with_state(sidecar_state)
 }
 
 async fn serve_streamable_http(
     shared_picker: SharedPicker,
     shared_frecency: SharedFrecency,
+    root: &str,
     bind: &str,
     path: &str,
+    registry_path: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let addr: SocketAddr = bind.parse()?;
     let http_path = normalize_http_path(path);
@@ -329,12 +551,15 @@ async fn serve_streamable_http(
     let router = build_streamable_http_router(
         shared_picker,
         shared_frecency,
+        root,
         &http_path,
         cancellation_token.child_token(),
     );
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let local_addr = listener.local_addr()?;
+    let registry_path = write_sidecar_registry(registry_path, root, local_addr, &http_path)?;
     tracing::info!(%local_addr, path = %http_path, "FFF MCP Streamable HTTP server listening");
+    tracing::info!(path = %registry_path.display(), "FFF sidecar registry written");
 
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
@@ -456,6 +681,72 @@ mod tests {
         (headers, body.to_string())
     }
 
+    async fn post_json(addr: SocketAddr, path: &str, body: &str) -> String {
+        let mut stream = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connect test HTTP server");
+        let request = format!(
+            "POST {path} HTTP/1.1\r\n\
+             Host: {addr}\r\n\
+             Content-Type: application/json\r\n\
+             Accept: application/json\r\n\
+             Connection: close\r\n\
+             Content-Length: {}\r\n\
+             \r\n\
+             {body}",
+            body.len()
+        );
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("write HTTP request");
+
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .await
+            .expect("read HTTP response");
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "unexpected HTTP response: {response}"
+        );
+        response
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body.to_string())
+            .expect("HTTP response contains body separator")
+    }
+
+    async fn spawn_test_router(
+        temp_repo: &std::path::Path,
+    ) -> (SocketAddr, CancellationToken, tokio::task::JoinHandle<()>) {
+        let (shared_picker, shared_frecency) = create_test_picker(temp_repo);
+        let cancellation_token = CancellationToken::new();
+        let router = build_streamable_http_router(
+            shared_picker,
+            shared_frecency,
+            temp_repo.to_string_lossy().as_ref(),
+            "/mcp",
+            cancellation_token.child_token(),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("get test listener addr");
+        let server = tokio::spawn({
+            let cancellation_token = cancellation_token.clone();
+            async move {
+                axum::serve(listener, router)
+                    .with_graceful_shutdown(async move {
+                        cancellation_token.cancelled_owned().await;
+                    })
+                    .await
+                    .expect("serve streamable HTTP test server");
+            }
+        });
+        (addr, cancellation_token, server)
+    }
+
     fn create_test_picker(base_path: &std::path::Path) -> (SharedPicker, SharedFrecency) {
         let shared_picker = SharedPicker::default();
         let shared_frecency = SharedFrecency::default();
@@ -500,30 +791,7 @@ mod tests {
     #[tokio::test]
     async fn streamable_http_serves_find_files() {
         let temp_repo = make_temp_repo();
-        let (shared_picker, shared_frecency) = create_test_picker(&temp_repo);
-        let cancellation_token = CancellationToken::new();
-        let router = build_streamable_http_router(
-            shared_picker,
-            shared_frecency,
-            "/mcp",
-            cancellation_token.child_token(),
-        );
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind test listener");
-        let addr = listener.local_addr().expect("get test listener addr");
-        let server = tokio::spawn({
-            let cancellation_token = cancellation_token.clone();
-            async move {
-                axum::serve(listener, router)
-                    .with_graceful_shutdown(async move {
-                        cancellation_token.cancelled_owned().await;
-                    })
-                    .await
-                    .expect("serve streamable HTTP test server");
-            }
-        });
+        let (addr, cancellation_token, server) = spawn_test_router(&temp_repo).await;
 
         let init = serde_json::json!({
             "jsonrpc": "2.0",
@@ -577,6 +845,104 @@ mod tests {
         server.await.expect("join test server");
         std::fs::remove_dir_all(temp_repo).ok();
     }
+
+    #[tokio::test]
+    async fn fffq_http_routes_share_the_streamable_http_sidecar() {
+        let temp_repo = make_temp_repo();
+        let (addr, cancellation_token, server) = spawn_test_router(&temp_repo).await;
+
+        let find_body = post_json(
+            addr,
+            "/fffq/find",
+            &serde_json::json!({
+                "query": "README",
+                "maxResults": 5
+            })
+            .to_string(),
+        )
+        .await;
+        let find_json: serde_json::Value =
+            serde_json::from_str(&find_body).expect("parse fffq find response");
+        assert!(
+            find_json
+                .get("text")
+                .and_then(|value| value.as_str())
+                .is_some_and(|text| text.contains("README.md")),
+            "find response did not include README.md: {find_json}"
+        );
+
+        let batch_body = post_json(
+            addr,
+            "/fffq/batch",
+            &serde_json::json!({
+                "ops": [
+                    {
+                        "tool": "find_files",
+                        "query": "main",
+                        "maxResults": 5
+                    },
+                    {
+                        "tool": "grep",
+                        "query": "fn main",
+                        "maxResults": 5
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .await;
+        let batch_json: serde_json::Value =
+            serde_json::from_str(&batch_body).expect("parse fffq batch response");
+        let results = batch_json
+            .get("results")
+            .and_then(|value| value.as_array())
+            .expect("batch response contains results");
+        assert_eq!(results.len(), 2);
+        assert!(
+            results
+                .iter()
+                .all(|item| item.get("ok").and_then(|value| value.as_bool()) == Some(true)),
+            "batch response included failing item: {batch_json}"
+        );
+
+        cancellation_token.cancel();
+        server.await.expect("join test server");
+        std::fs::remove_dir_all(temp_repo).ok();
+    }
+
+    #[test]
+    fn writes_sidecar_registry_with_http_and_mcp_urls() {
+        let temp_repo = make_temp_repo();
+        let registry_path = temp_repo.join("sidecar.json");
+        let addr: SocketAddr = "127.0.0.1:54321".parse().expect("parse socket addr");
+
+        let written = write_sidecar_registry(
+            Some(registry_path.to_string_lossy().as_ref()),
+            temp_repo.to_string_lossy().as_ref(),
+            addr,
+            "/mcp",
+        )
+        .expect("write sidecar registry");
+        assert_eq!(written, registry_path);
+
+        let registry: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&registry_path).expect("read sidecar registry"))
+                .expect("parse sidecar registry");
+        assert_eq!(
+            registry.get("root").and_then(|value| value.as_str()),
+            Some(temp_repo.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            registry.get("mcp_url").and_then(|value| value.as_str()),
+            Some("http://127.0.0.1:54321/mcp")
+        );
+        assert_eq!(
+            registry.get("fffq_url").and_then(|value| value.as_str()),
+            Some("http://127.0.0.1:54321/fffq")
+        );
+
+        std::fs::remove_dir_all(temp_repo).ok();
+    }
 }
 
 #[tokio::main]
@@ -619,6 +985,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             base_path
         }
     };
+    let base_path_for_http = base_path.clone();
 
     let shared_picker = SharedPicker::default();
     let shared_frecency = SharedFrecency::default();
@@ -700,8 +1067,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         serve_streamable_http(
             shared_picker.clone(),
             shared_frecency.clone(),
+            &base_path_for_http,
             &args.http_bind,
             &args.http_path,
+            args.registry_path.as_deref(),
         )
         .await?;
     } else {
