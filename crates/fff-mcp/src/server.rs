@@ -236,6 +236,142 @@ impl FffServer {
         result.content.push(Content::text(notice));
     }
 
+    fn call_result_text(result: CallToolResult) -> String {
+        result
+            .content
+            .into_iter()
+            .filter_map(|content| content.as_text().map(|text| text.text.clone()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    pub fn find_files_text(&self, params: FindFilesParams) -> Result<String, ErrorData> {
+        let max_results = normalize_max_results(params.max_results, 20);
+        let query = &params.query;
+
+        let page_offset = params
+            .cursor
+            .as_deref()
+            .and_then(|id| self.cursor_store.lock().ok()?.get(id))
+            .unwrap_or(0);
+
+        let guard = self.picker.read().map_err(|e| {
+            ErrorData::internal_error(format!("Failed to acquire picker lock: {e}"), None)
+        })?;
+        let picker = guard
+            .as_ref()
+            .ok_or_else(|| ErrorData::internal_error("File picker not initialized", None))?;
+        let base_path = picker.base_path();
+        let make_opts = |offset: usize| FuzzySearchOptions {
+            max_threads: 0,
+            current_file: None,
+            project_path: Some(base_path),
+            combo_boost_score_multiplier: 100,
+            min_combo_count: 3,
+            pagination: PaginationArgs {
+                offset,
+                limit: max_results,
+            },
+        };
+
+        let parser = QueryParser::default();
+        let fff_query = parser.parse(query);
+        let result = picker.fuzzy_search(&fff_query, None, make_opts(page_offset));
+        let total_files = result.total_files;
+
+        // Auto-retry with fewer terms if 3+ words return 0 results
+        let words: Vec<&str> = query.split_whitespace().collect();
+        let shorter = words.get(..2).map(|w| w.join(" "));
+
+        let (items, scores, total_matched) =
+            if result.items.is_empty() && words.len() >= 3 && page_offset == 0 {
+                if let Some(shorter) = &shorter {
+                    let shorter_query = parser.parse(shorter);
+                    let retry = picker.fuzzy_search(&shorter_query, None, make_opts(0));
+
+                    (retry.items, retry.scores, retry.total_matched)
+                } else {
+                    (result.items, result.scores, result.total_matched)
+                }
+            } else {
+                (result.items, result.scores, result.total_matched)
+            };
+
+        if items.is_empty() {
+            return Ok(format!("0 results ({} indexed)", total_files));
+        }
+
+        let mut lines: Vec<String> = Vec::new();
+        let top_item = items[0];
+        let is_exact_match = scores[0].exact_match;
+
+        if page_offset == 0 {
+            if is_exact_match {
+                lines.push(format!(
+                    "→ Read {} (exact match!)",
+                    top_item.relative_path(picker)
+                ));
+            } else if scores.len() < 2 || scores[0].total > scores[1].total.saturating_mul(2) {
+                lines.push(format!(
+                    "→ Read {} (best match — Read this file directly)",
+                    top_item.relative_path(picker)
+                ));
+            }
+        }
+
+        let next_offset = page_offset + items.len();
+        let has_more = next_offset < total_matched;
+
+        if has_more {
+            lines.push(format!("{}/{} matches", items.len(), total_matched));
+        }
+
+        for item in &items {
+            lines.push(format!(
+                "{}{}",
+                item.relative_path(picker),
+                file_suffix(item.git_status, item.total_frecency_score())
+            ));
+        }
+
+        if has_more {
+            let mut cs = self.lock_cursors()?;
+            let cursor_id = cs.store(next_offset);
+            lines.push(format!("cursor: {}", cursor_id));
+        }
+
+        Ok(lines.join("\n"))
+    }
+
+    pub fn grep_text(&self, params: GrepParams) -> Result<String, ErrorData> {
+        let max_results = normalize_max_results(params.max_results, 20);
+        let output_mode = OutputMode::new(params.output_mode.as_deref());
+
+        let parsed = QueryParser::new(AiGrepConfig).parse(&params.query);
+        let grep_text = parsed.grep_text();
+
+        let mode = if has_regex_metacharacters(&grep_text) {
+            GrepMode::Regex
+        } else {
+            GrepMode::PlainText
+        };
+
+        let result = self.perform_grep(
+            &params.query,
+            mode,
+            max_results,
+            params.cursor.as_deref(),
+            output_mode,
+            None,
+        )?;
+        Ok(Self::call_result_text(result))
+    }
+
+    pub fn multi_grep_text(&self, params: MultiGrepParams) -> Result<String, ErrorData> {
+        let result = self.multi_grep_inner(params)?;
+        Ok(Self::call_result_text(result))
+    }
+
     fn perform_grep(
         &self,
         query: &str,
@@ -410,104 +546,9 @@ impl FffServer {
         &self,
         Parameters(params): Parameters<FindFilesParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let max_results = normalize_max_results(params.max_results, 20);
-        let query = &params.query;
+        let text = self.find_files_text(params)?;
+        let mut result = CallToolResult::success(vec![Content::text(text)]);
 
-        let page_offset = params
-            .cursor
-            .as_deref()
-            .and_then(|id| self.cursor_store.lock().ok()?.get(id))
-            .unwrap_or(0);
-
-        let guard = self.picker.read().map_err(|e| {
-            ErrorData::internal_error(format!("Failed to acquire picker lock: {e}"), None)
-        })?;
-        let picker = guard
-            .as_ref()
-            .ok_or_else(|| ErrorData::internal_error("File picker not initialized", None))?;
-        let base_path = picker.base_path();
-        let make_opts = |offset: usize| FuzzySearchOptions {
-            max_threads: 0,
-            current_file: None,
-            project_path: Some(base_path),
-            combo_boost_score_multiplier: 100,
-            min_combo_count: 3,
-            pagination: PaginationArgs {
-                offset,
-                limit: max_results,
-            },
-        };
-
-        let parser = QueryParser::default();
-        let fff_query = parser.parse(query);
-        let result = picker.fuzzy_search(&fff_query, None, make_opts(page_offset));
-        let total_files = result.total_files;
-
-        // Auto-retry with fewer terms if 3+ words return 0 results
-        let words: Vec<&str> = query.split_whitespace().collect();
-        let shorter = words.get(..2).map(|w| w.join(" "));
-
-        let (items, scores, total_matched) =
-            if result.items.is_empty() && words.len() >= 3 && page_offset == 0 {
-                if let Some(shorter) = &shorter {
-                    let shorter_query = parser.parse(shorter);
-                    let retry = picker.fuzzy_search(&shorter_query, None, make_opts(0));
-
-                    (retry.items, retry.scores, retry.total_matched)
-                } else {
-                    (result.items, result.scores, result.total_matched)
-                }
-            } else {
-                (result.items, result.scores, result.total_matched)
-            };
-
-        if items.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(format!(
-                "0 results ({} indexed)",
-                total_files
-            ))]));
-        }
-
-        let mut lines: Vec<String> = Vec::new();
-        let top_item = items[0];
-        let is_exact_match = scores[0].exact_match;
-
-        if page_offset == 0 {
-            if is_exact_match {
-                lines.push(format!(
-                    "→ Read {} (exact match!)",
-                    top_item.relative_path(picker)
-                ));
-            } else if scores.len() < 2 || scores[0].total > scores[1].total.saturating_mul(2) {
-                lines.push(format!(
-                    "→ Read {} (best match — Read this file directly)",
-                    top_item.relative_path(picker)
-                ));
-            }
-        }
-
-        let next_offset = page_offset + items.len();
-        let has_more = next_offset < total_matched;
-
-        if has_more {
-            lines.push(format!("{}/{} matches", items.len(), total_matched));
-        }
-
-        for item in &items {
-            lines.push(format!(
-                "{}{}",
-                item.relative_path(picker),
-                file_suffix(item.git_status, item.total_frecency_score())
-            ));
-        }
-
-        if has_more {
-            let mut cs = self.lock_cursors()?;
-            let cursor_id = cs.store(next_offset);
-            lines.push(format!("cursor: {}", cursor_id));
-        }
-
-        let mut result = CallToolResult::success(vec![Content::text(lines.join("\n"))]);
         self.maybe_append_update_notice(&mut result);
         Ok(result)
     }
@@ -522,26 +563,9 @@ impl FffServer {
         &self,
         Parameters(params): Parameters<GrepParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let max_results = normalize_max_results(params.max_results, 20);
-        let output_mode = OutputMode::new(params.output_mode.as_deref());
+        let text = self.grep_text(params)?;
+        let mut result = CallToolResult::success(vec![Content::text(text)]);
 
-        let parsed = QueryParser::new(AiGrepConfig).parse(&params.query);
-        let grep_text = parsed.grep_text();
-
-        let mode = if has_regex_metacharacters(&grep_text) {
-            GrepMode::Regex
-        } else {
-            GrepMode::PlainText
-        };
-
-        let mut result = self.perform_grep(
-            &params.query,
-            mode,
-            max_results,
-            params.cursor.as_deref(),
-            output_mode,
-            None,
-        )?;
         self.maybe_append_update_notice(&mut result);
         Ok(result)
     }
@@ -556,7 +580,8 @@ impl FffServer {
         &self,
         Parameters(params): Parameters<MultiGrepParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let mut result = self.multi_grep_inner(params)?;
+        let text = self.multi_grep_text(params)?;
+        let mut result = CallToolResult::success(vec![Content::text(text)]);
         self.maybe_append_update_notice(&mut result);
         Ok(result)
     }

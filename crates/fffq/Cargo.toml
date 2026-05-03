@@ -1,0 +1,17 @@
+[package]
+name = "fffq"
+version = "0.6.4"
+edition = "2024"
+description = "Lightweight CLI client for the fff-mcp streamable HTTP sidecar"
+license = "MIT"
+
+[[bin]]
+name = "fffq"
+path = "src/main.rs"
+
+[dependencies]
+blake3 = { workspace = true }
+clap = { version = "4", features = ["derive", "env"] }
+git2 = { workspace = true }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
