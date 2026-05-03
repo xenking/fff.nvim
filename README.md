@@ -26,7 +26,7 @@ Works with Claude Code, Codex, OpenCode, Cursor, Cline, and any MCP-capable clie
 Linux / macOS:
 
 ```bash
-curl -L https://dmtrkovalenko.dev/install-fff-mcp.sh | bash
+curl -fsSL https://raw.githubusercontent.com/xenking/fff.nvim/main/install-mcp.sh | bash
 ```
 
 Windows (PowerShell):
@@ -35,7 +35,7 @@ Windows (PowerShell):
 irm https://raw.githubusercontent.com/dmtrKovalenko/fff.nvim/main/install-mcp.ps1 | iex
 ```
 
-The scripts live at [`install-mcp.sh`](./install-mcp.sh) and [`install-mcp.ps1`](./install-mcp.ps1) if you want to read them first.
+The scripts live at [`install-mcp.sh`](./install-mcp.sh) and [`install-mcp.ps1`](./install-mcp.ps1) if you want to read them first. The Linux/macOS script installs both `fff-mcp` and `fffq` from the latest GitHub release.
 
 It prints the exact wiring instructions for your client. Once the server is connected, ask the agent to "use fff" and it picks up the `ffgrep`, `fffind`, and `fff-multi-grep` tools.
 

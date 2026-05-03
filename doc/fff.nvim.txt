@@ -34,7 +34,7 @@ ONE-LINE INSTALL ~
 Linux / macOS:
 
 >bash
-    curl -L https://dmtrkovalenko.dev/install-fff-mcp.sh | bash
+    curl -fsSL https://raw.githubusercontent.com/xenking/fff.nvim/main/install-mcp.sh | bash
 <
 
 Windows (PowerShell):
@@ -44,7 +44,8 @@ Windows (PowerShell):
 <
 
 The scripts live at `install-mcp.sh` <./install-mcp.sh> and `install-mcp.ps1`
-<./install-mcp.ps1> if you want to read them first.
+<./install-mcp.ps1> if you want to read them first. The Linux/macOS script
+installs both `fff-mcp` and `fffq` from the latest GitHub release.
 
 It prints the exact wiring instructions for your client. Once the server is
 connected, ask the agent to "use fff" and it picks up the `ffgrep`, `fffind`,
