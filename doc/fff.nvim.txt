@@ -36,7 +36,8 @@ ONE-LINE INSTALL ~
 <
 
 The script lives at `install-mcp.sh` <./install-mcp.sh> if you want to read it
-first. It installs both `fff-mcp` and `fffq` from the latest GitHub release.
+first. It installs both `fff-mcp` and `fffq` from the latest GitHub release,
+with a source-build fallback for platforms without a prebuilt asset.
 
 It prints the exact wiring instructions for your client. Once the server is
 connected, ask the agent to "use fff" and it picks up the `ffgrep`, `fffind`,

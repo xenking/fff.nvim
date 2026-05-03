@@ -72,7 +72,7 @@ get_latest_release_tag() {
         ')
 
     if [ -z "$tag" ]; then
-        error "No release found containing fff-mcp binaries for ${target}. The MCP build may not have been released yet."
+        return 1
     fi
     echo "$tag"
 }
@@ -92,26 +92,26 @@ download_binary() {
 
     if ! curl -fsSL -o "$output_path" "$url" 2>/dev/null; then
         echo "" >&2
-        printf '\033[1;31mError: Failed to download %s for your platform.\033[0m\n' "$binary_name" >&2
+        printf '\033[1;33mWarning: Failed to download %s for your platform.\033[0m\n' "$binary_name" >&2
         echo "" >&2
         echo "  URL: ${url}" >&2
         echo "  Release: ${tag}" >&2
         echo "  Platform: ${target}" >&2
         echo "" >&2
         echo "Check available releases at: https://github.com/${REPO}/releases" >&2
-        exit 1
+        return 1
     fi
 
     if curl -fsSL -o "${output_path}.sha256" "$checksum_url" 2>/dev/null; then
         info "Verifying ${filename} checksum..."
         if command -v sha256sum &>/dev/null; then
             (cd "$(dirname "$output_path")" && sha256sum -c "$(basename "${output_path}.sha256")") \
-                || error "Checksum verification failed for ${filename}!"
+                || return 1
         elif command -v shasum &>/dev/null; then
             local expected actual
             expected="$(awk '{print $1}' "${output_path}.sha256")"
             actual="$(shasum -a 256 "$output_path" | awk '{print $1}')"
-            [ "$expected" = "$actual" ] || error "Checksum verification failed for ${filename}!"
+            [ "$expected" = "$actual" ] || return 1
         else
             warn "No checksum tool found, skipping checksum verification for ${filename}."
         fi
@@ -133,8 +133,8 @@ download_binaries() {
     tmp_dir="$(mktemp -d)"
     trap 'rm -rf "$tmp_dir"' EXIT
 
-    download_binary "fff-mcp" "$target" "$tag" "$ext" "${tmp_dir}/fff-mcp-${target}${ext}"
-    download_binary "fffq" "$target" "$tag" "$ext" "${tmp_dir}/fffq-${target}${ext}"
+    download_binary "fff-mcp" "$target" "$tag" "$ext" "${tmp_dir}/fff-mcp-${target}${ext}" || return 1
+    download_binary "fffq" "$target" "$tag" "$ext" "${tmp_dir}/fffq-${target}${ext}" || return 1
 
     mkdir -p "$INSTALL_DIR"
     mv "${tmp_dir}/fff-mcp-${target}${ext}" "${INSTALL_DIR}/fff-mcp${ext}"
@@ -145,6 +145,37 @@ download_binaries() {
         success "Installed fff-mcp to ${INSTALL_DIR}/fff-mcp${ext}"
         success "Installed fffq to ${INSTALL_DIR}/fffq${ext}"
     fi
+}
+
+build_from_source() {
+    local ext=""
+
+    case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*) ext=".exe" ;;
+    esac
+
+    command -v git &>/dev/null || error "git is required to build from source"
+    command -v cargo &>/dev/null || error "cargo is required to build from source when no prebuilt binary is available"
+
+    info "Building fff-mcp and fffq from source..."
+
+    local tmp_dir
+    tmp_dir="$(mktemp -d)"
+    trap 'rm -rf "$tmp_dir"' EXIT
+
+    git clone --depth 1 "https://github.com/${REPO}.git" "${tmp_dir}/src" \
+        || error "Failed to clone https://github.com/${REPO}.git"
+
+    (cd "${tmp_dir}/src" && cargo build --release -p fff-mcp -p fffq) \
+        || error "Source build failed"
+
+    mkdir -p "$INSTALL_DIR"
+    cp "${tmp_dir}/src/target/release/fff-mcp${ext}" "${INSTALL_DIR}/fff-mcp${ext}"
+    cp "${tmp_dir}/src/target/release/fffq${ext}" "${INSTALL_DIR}/fffq${ext}"
+    chmod +x "${INSTALL_DIR}/fff-mcp${ext}" "${INSTALL_DIR}/fffq${ext}"
+
+    success "Built and installed fff-mcp to ${INSTALL_DIR}/fff-mcp${ext}"
+    success "Built and installed fffq to ${INSTALL_DIR}/fffq${ext}"
 }
 
 check_path() {
@@ -274,14 +305,19 @@ main() {
 
     info "Detected platform: ${target}"
 
-    local tag
-    tag="$(get_latest_release_tag "$target")"
+    local tag installed_version
+    if tag="$(get_latest_release_tag "$target")" && download_binaries "$target" "$tag"; then
+        installed_version="$tag"
+    else
+        warn "No usable prebuilt release asset for ${target}; falling back to source build."
+        build_from_source
+        installed_version="source"
+    fi
 
-    download_binaries "$target" "$tag"
 
     if [ "$IS_UPDATE" = true ]; then
         echo ""
-        success "FFF MCP Server updated to ${tag}!"
+        success "FFF MCP Server updated from ${installed_version}!"
         echo ""
     else
         check_path
