@@ -31,13 +31,25 @@ The script lives at [`install-mcp.sh`](./install-mcp.sh) if you want to read it 
 
 It prints the exact wiring instructions for your client. Once the server is connected, ask the agent to "use fff" and it picks up the `ffgrep`, `fffind`, and `fff-multi-grep` tools.
 
-### Recommended agent prompt
+### Recommended agent prompt and skills
 
-Drop this into your project's `CLAUDE.md` or equivalent:
+Drop this into your project's `CLAUDE.md`, `AGENTS.md`, or equivalent:
 
 ```markdown
 For any file search or grep in the current git-indexed directory, use fff tools.
 ```
+
+Ready-to-copy Codex and Claude Code skills are included in [`skills/`](./skills/):
+
+```bash
+mkdir -p ~/.codex/skills/fffq ~/.claude/skills/fffq
+cp skills/codex/fffq/SKILL.md ~/.codex/skills/fffq/SKILL.md
+cp skills/claude/fffq/SKILL.md ~/.claude/skills/fffq/SKILL.md
+```
+
+These skills teach agents to use `fffq ensure`, `fffq find`, `fffq grep`, and
+`fffq multi-grep` through the per-project streamable HTTP sidecar before falling
+back to shell search.
 
 ### What changes
 
