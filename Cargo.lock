@@ -741,6 +741,7 @@ name = "fff-mcp"
 version = "0.7.2"
 dependencies = [
  "axum",
+ "blake3",
  "clap",
  "fff-query-parser",
  "fff-search",
@@ -858,6 +859,17 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "zlob",
+]
+
+[[package]]
+name = "fffq"
+version = "0.6.4"
+dependencies = [
+ "blake3",
+ "clap",
+ "git2",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

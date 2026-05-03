@@ -1375,6 +1375,10 @@ fn stop_picker(shared_picker: &SharedFilePicker) {
 
 fn git_run(dir: &Path, args: &[&str]) {
     let out = Command::new("git")
+        .arg("-c")
+        .arg("commit.gpgsign=false")
+        .arg("-c")
+        .arg("tag.gpgsign=false")
         .args(args)
         .current_dir(dir)
         .env("GIT_AUTHOR_NAME", "test")
