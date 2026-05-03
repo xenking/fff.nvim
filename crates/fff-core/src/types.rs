@@ -518,9 +518,9 @@ impl FileItem {
 }
 
 /// Files smaller than one page waste the remainder when mmapped.
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(not(target_os = "windows"), target_arch = "aarch64"))]
 const MMAP_THRESHOLD: u64 = 16 * 1024;
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(all(not(target_os = "windows"), not(target_arch = "aarch64")))]
 const MMAP_THRESHOLD: u64 = 4 * 1024;
 
 fn load_file_content(path: &Path, size: u64) -> Option<FileContent> {
