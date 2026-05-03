@@ -55,28 +55,6 @@ detect_platform() {
     echo "$target"
 }
 
-get_latest_release_tag() {
-    local target="$1"
-    local releases_json
-    releases_json=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases") \
-        || error "Failed to fetch releases from https://github.com/${REPO}/releases"
-
-    # Find the first release that contains an fff-mcp binary for our platform.
-    # fffq is downloaded from the same release.
-    local tag
-    tag=$(echo "$releases_json" \
-        | grep -oE '"(tag_name|name)": *"[^"]*"' \
-        | awk -v target="fff-mcp-${target}" '
-            /"tag_name":/ { gsub(/.*": *"|"/, ""); current_tag = $0; next }
-            /"name":/ && index($0, target) { print current_tag; exit }
-        ')
-
-    if [ -z "$tag" ]; then
-        return 1
-    fi
-    echo "$tag"
-}
-
 download_binary() {
     local binary_name="$1"
     local target="$2"
@@ -84,11 +62,16 @@ download_binary() {
     local ext="$4"
 
     local filename="${binary_name}-${target}${ext}"
-    local url="https://github.com/${REPO}/releases/download/${tag}/${filename}"
+    local url
+    if [ "$tag" = "latest" ]; then
+        url="https://github.com/${REPO}/releases/latest/download/${filename}"
+    else
+        url="https://github.com/${REPO}/releases/download/${tag}/${filename}"
+    fi
     local checksum_url="${url}.sha256"
     local output_path="$5"
 
-    info "Downloading ${filename} from release ${tag}..."
+    info "Downloading ${filename} from ${tag} release..."
 
     if ! curl -fsSL -o "$output_path" "$url" 2>/dev/null; then
         echo "" >&2
@@ -305,9 +288,9 @@ main() {
 
     info "Detected platform: ${target}"
 
-    local tag installed_version
-    if tag="$(get_latest_release_tag "$target")" && download_binaries "$target" "$tag"; then
-        installed_version="$tag"
+    local installed_version
+    if download_binaries "$target" "latest"; then
+        installed_version="latest release"
     else
         warn "No usable prebuilt release asset for ${target}; falling back to source build."
         build_from_source
