@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 set -eo pipefail
 
-# FFF MCP Server installer
-# Usage: curl -fsSL https://raw.githubusercontent.com/dmtrKovalenko/fff.nvim/main/install-mcp.sh | bash
+# FFF MCP + fffq installer
+# Usage: curl -fsSL https://raw.githubusercontent.com/xenking/fff.nvim/main/install-mcp.sh | bash
 
-REPO="dmtrKovalenko/fff.nvim"
-BINARY_NAME="fff-mcp"
+REPO="${FFF_MCP_REPO:-xenking/fff.nvim}"
 INSTALL_DIR="${FFF_MCP_INSTALL_DIR:-$HOME/.local/bin}"
 
 info() { printf '\033[1;34m%s\033[0m\n' "$*"; }
@@ -30,10 +29,9 @@ detect_platform() {
 
     case "$os" in
         Linux)
-            # Prefer musl (static) for maximum compatibility
             case "$arch" in
-                x86_64)  target="x86_64-unknown-linux-musl" ;;
-                aarch64|arm64) target="aarch64-unknown-linux-musl" ;;
+                x86_64)  target="x86_64-unknown-linux-gnu" ;;
+                aarch64|arm64) target="aarch64-unknown-linux-gnu" ;;
                 *) error "Unsupported architecture: $arch" ;;
             esac
             ;;
@@ -63,7 +61,8 @@ get_latest_release_tag() {
     releases_json=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases") \
         || error "Failed to fetch releases from https://github.com/${REPO}/releases"
 
-    # Find the first release that contains an fff-mcp binary for our platform
+    # Find the first release that contains an fff-mcp binary for our platform.
+    # fffq is downloaded from the same release.
     local tag
     tag=$(echo "$releases_json" \
         | grep -oE '"(tag_name|name)": *"[^"]*"' \
@@ -79,6 +78,49 @@ get_latest_release_tag() {
 }
 
 download_binary() {
+    local binary_name="$1"
+    local target="$2"
+    local tag="$3"
+    local ext="$4"
+
+    local filename="${binary_name}-${target}${ext}"
+    local url="https://github.com/${REPO}/releases/download/${tag}/${filename}"
+    local checksum_url="${url}.sha256"
+    local output_path="$5"
+
+    info "Downloading ${filename} from release ${tag}..."
+
+    if ! curl -fsSL -o "$output_path" "$url" 2>/dev/null; then
+        echo "" >&2
+        printf '\033[1;31mError: Failed to download %s for your platform.\033[0m\n' "$binary_name" >&2
+        echo "" >&2
+        echo "  URL: ${url}" >&2
+        echo "  Release: ${tag}" >&2
+        echo "  Platform: ${target}" >&2
+        echo "" >&2
+        echo "Check available releases at: https://github.com/${REPO}/releases" >&2
+        exit 1
+    fi
+
+    if curl -fsSL -o "${output_path}.sha256" "$checksum_url" 2>/dev/null; then
+        info "Verifying ${filename} checksum..."
+        if command -v sha256sum &>/dev/null; then
+            (cd "$(dirname "$output_path")" && sha256sum -c "$(basename "${output_path}.sha256")") \
+                || error "Checksum verification failed for ${filename}!"
+        elif command -v shasum &>/dev/null; then
+            local expected actual
+            expected="$(awk '{print $1}' "${output_path}.sha256")"
+            actual="$(shasum -a 256 "$output_path" | awk '{print $1}')"
+            [ "$expected" = "$actual" ] || error "Checksum verification failed for ${filename}!"
+        else
+            warn "No checksum tool found, skipping checksum verification for ${filename}."
+        fi
+    else
+        warn "Checksum file for ${filename} not available, skipping verification."
+    fi
+}
+
+download_binaries() {
     local target="$1"
     local tag="$2"
     local ext=""
@@ -87,47 +129,21 @@ download_binary() {
         *windows*) ext=".exe" ;;
     esac
 
-    local filename="${BINARY_NAME}-${target}${ext}"
-    local url="https://github.com/${REPO}/releases/download/${tag}/${filename}"
-    local checksum_url="${url}.sha256"
-
-    info "Downloading ${filename} from release ${tag}..."
-
     local tmp_dir
     tmp_dir="$(mktemp -d)"
     trap 'rm -rf "$tmp_dir"' EXIT
 
-    if ! curl -fsSL -o "${tmp_dir}/${filename}" "$url" 2>/dev/null; then
-        echo "" >&2
-        printf '\033[1;31mError: Failed to download binary for your platform.\033[0m\n' >&2
-        echo "" >&2
-        echo "  URL: ${url}" >&2
-        echo "  Release: ${tag}" >&2
-        echo "  Platform: ${target}" >&2
-        echo "" >&2
-        echo "This likely means the MCP binary hasn't been built for this release yet." >&2
-        echo "Check available releases at: https://github.com/${REPO}/releases" >&2
-        exit 1
-    fi
+    download_binary "fff-mcp" "$target" "$tag" "$ext" "${tmp_dir}/fff-mcp-${target}${ext}"
+    download_binary "fffq" "$target" "$tag" "$ext" "${tmp_dir}/fffq-${target}${ext}"
 
-    # Verify checksum if sha256sum is available
-    if command -v sha256sum &>/dev/null; then
-        if curl -fsSL -o "${tmp_dir}/${filename}.sha256" "$checksum_url" 2>/dev/null; then
-            info "Verifying checksum..."
-            (cd "$tmp_dir" && sha256sum -c "${filename}.sha256") \
-                || error "Checksum verification failed!"
-        else
-            warn "Checksum file not available, skipping verification."
-        fi
-    fi
-
-    # Install
     mkdir -p "$INSTALL_DIR"
-    mv "${tmp_dir}/${filename}" "${INSTALL_DIR}/${BINARY_NAME}${ext}"
-    chmod +x "${INSTALL_DIR}/${BINARY_NAME}${ext}"
+    mv "${tmp_dir}/fff-mcp-${target}${ext}" "${INSTALL_DIR}/fff-mcp${ext}"
+    mv "${tmp_dir}/fffq-${target}${ext}" "${INSTALL_DIR}/fffq${ext}"
+    chmod +x "${INSTALL_DIR}/fff-mcp${ext}" "${INSTALL_DIR}/fffq${ext}"
 
     if [ "$IS_UPDATE" != true ]; then
-        success "Installed ${BINARY_NAME} to ${INSTALL_DIR}/${BINARY_NAME}${ext}"
+        success "Installed fff-mcp to ${INSTALL_DIR}/fff-mcp${ext}"
+        success "Installed fffq to ${INSTALL_DIR}/fffq${ext}"
     fi
 }
 
@@ -160,11 +176,12 @@ check_path() {
 }
 
 print_setup_instructions() {
-    local binary_path="${INSTALL_DIR}/${BINARY_NAME}"
+    local binary_path="${INSTALL_DIR}/fff-mcp"
+    local fffq_path="${INSTALL_DIR}/fffq"
     local found_any=false
 
     echo ""
-    success "FFF MCP Server installed successfully!"
+    success "FFF MCP Server and fffq installed successfully!"
     echo ""
     info "Setup with your AI coding assistant:"
     echo ""
@@ -215,7 +232,9 @@ print_setup_instructions() {
         found_any=true
         success "[Codex] detected"
         echo ""
-        echo "codex mcp add fff -- fff-mcp"
+        echo "Use fffq directly for searches:"
+        echo "fffq ensure"
+        echo "fffq grep query"
         echo ""
     fi
 
@@ -226,12 +245,13 @@ print_setup_instructions() {
         echo ""
     fi
 
-    echo "Binary: ${binary_path}"
-    echo "Docs:   https://github.com/${REPO}"
+    echo "fff-mcp: ${binary_path}"
+    echo "fffq:    ${fffq_path}"
+    echo "Docs:    https://github.com/${REPO}"
     echo ""
-    info "Tip: Add this to your CLAUDE.md or AGENTS.md to make AI use fff for all searches:"
+    info "Tip: Add this to your CLAUDE.md or AGENTS.md to make AI use fffq for all searches:"
     echo "\""
-    echo "Use the fff MCP tools for all file search operations instead of default tools."
+    echo "Use fffq for file search operations. Run fffq ensure once per project."
     echo "\""
 
 
@@ -241,7 +261,7 @@ main() {
     local target
     target="$(detect_platform)"
 
-    local existing_binary="${INSTALL_DIR}/${BINARY_NAME}"
+    local existing_binary="${INSTALL_DIR}/fff-mcp"
     IS_UPDATE=false
 
     if [ -x "$existing_binary" ]; then
@@ -257,7 +277,7 @@ main() {
     local tag
     tag="$(get_latest_release_tag "$target")"
 
-    download_binary "$target" "$tag"
+    download_binaries "$target" "$tag"
 
     if [ "$IS_UPDATE" = true ]; then
         echo ""
