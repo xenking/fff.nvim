@@ -1,6 +1,6 @@
 [package]
 name = "fffq"
-version = "0.6.4"
+version = "0.7.0"
 edition = "2024"
 description = "Lightweight CLI client for the fff-mcp streamable HTTP sidecar"
 license = "MIT"
