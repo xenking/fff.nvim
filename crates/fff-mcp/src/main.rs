@@ -740,8 +740,8 @@ mod tests {
         (addr, cancellation_token, server)
     }
 
-    fn create_test_picker(base_path: &std::path::Path) -> (SharedPicker, SharedFrecency) {
-        let shared_picker = SharedPicker::default();
+    fn create_test_picker(base_path: &std::path::Path) -> (SharedFilePicker, SharedFrecency) {
+        let shared_picker = SharedFilePicker::default();
         let shared_frecency = SharedFrecency::default();
         FilePicker::new_with_shared_state(
             shared_picker.clone(),
