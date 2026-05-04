@@ -823,14 +823,17 @@ fn is_dotgit_change_affecting_status(changed: &Path, repo: &Option<Repository>) 
     if let Ok(path_in_git_dir) = changed.strip_prefix(git_dir) {
         // Only react to changes that rewrite the worktree state: commits,
         // staging, checkouts, merges, conflict resolution. Ref-only updates
-        // under refs/ (fetch, push, tag writes, pack-refs) do not change
-        // which files are modified/untracked, so we deliberately skip them —
-        // watching refs/ recursively would cost one inotify watch per ref
-        // namespace on repos with many branches/remotes.
+        // Commit updates to the current branch ref do affect worktree
+        // status because libgit2 compares the index against HEAD's tree.
+        // We watch only the active ref's parent (see watch_git_status_paths)
+        // instead of all refs to avoid one watch per ref namespace.
         if path_in_git_dir == Path::new("index") || path_in_git_dir == Path::new("index.lock") {
             return true;
         }
         if path_in_git_dir == Path::new("HEAD") {
+            return true;
+        }
+        if path_in_git_dir.starts_with(Path::new("refs/heads")) {
             return true;
         }
         if path_in_git_dir == Path::new("info/exclude")
@@ -868,12 +871,29 @@ fn watch_git_status_paths(debouncer: &mut Debouncer, git_workdir: Option<&PathBu
 
     // Watch .git/ non-recursively to catch top-level files:
     // index, index.lock, HEAD, MERGE_HEAD, CHERRY_PICK_HEAD, REVERT_HEAD.
-    // We intentionally do NOT watch refs/ — individual ref updates don't
-    // affect worktree status, and a recursive watch there blows up inotify
-    // watch counts on repos with many branches/remotes/tags.
     if let Err(e) = debouncer.watch(&git_dir, RecursiveMode::NonRecursive) {
         warn!("Failed to watch .git directory: {}", e);
         return;
+    }
+
+    // Watch the current branch ref parent. A commit usually updates
+    // .git/refs/heads/<branch> while .git/HEAD stays as the same symbolic
+    // ref, but git status must still be recomputed because HEAD's tree
+    // changed. Avoid recursively watching every ref namespace.
+    if let Ok(head) = std::fs::read_to_string(git_dir.join("HEAD"))
+        && let Some(ref_name) = head.strip_prefix("ref: ").map(str::trim)
+    {
+        let ref_path = git_dir.join(ref_name);
+        if let Some(parent) = ref_path.parent()
+            && parent.is_dir()
+            && let Err(e) = debouncer.watch(parent, RecursiveMode::NonRecursive)
+        {
+            warn!(
+                "Failed to watch current git ref parent {}: {}",
+                parent.display(),
+                e
+            );
+        }
     }
 
     // Watch info/ non-recursively for exclude and sparse-checkout
