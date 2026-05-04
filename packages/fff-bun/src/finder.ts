@@ -35,10 +35,10 @@ import {
 import type {
   DirSearchOptions,
   DirSearchResult,
+  InitOptions as FFFInitOptions,
   GrepOptions,
   GrepResult,
   HealthCheck,
-  InitOptions as FFFInitOptions,
   MixedSearchResult,
   MultiGrepOptions,
   Result,

@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+
 /**
  * Interactive file finder demo
  *
@@ -15,11 +16,11 @@
  *   :mixed       - mixed file + directory search
  */
 
-import { FileFinder } from "../src/index";
-import type { DirItem, FileItem, MixedItem, Score } from "../src/index";
-import * as readline from "node:readline";
-import { join } from "node:path";
 import { homedir } from "node:os";
+import { join } from "node:path";
+import * as readline from "node:readline";
+import type { DirItem, FileItem, MixedItem, Score } from "../src/index";
+import { FileFinder } from "../src/index";
 
 const RESET = "\x1b[0m";
 const BOLD = "\x1b[1m";

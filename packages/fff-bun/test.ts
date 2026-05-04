@@ -1,5 +1,5 @@
+import { dirname, resolve } from "node:path";
 import { FileFinder } from "./src/index";
-import { resolve, dirname } from "node:path";
 
 async function main() {
   console.log("=== fff Test Script ===\n");

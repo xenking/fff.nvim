@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+
 /**
  * Interactive live grep demo
  *
@@ -9,9 +10,9 @@
  * content search prompt with match highlighting.
  */
 
+import * as readline from "node:readline";
 import { FileFinder } from "../src/index";
 import type { GrepMode } from "../src/types";
-import * as readline from "node:readline";
 
 const RESET = "\x1b[0m";
 const BOLD = "\x1b[1m";
