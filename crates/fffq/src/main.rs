@@ -142,14 +142,19 @@ fn run() -> Result<()> {
             max_results,
             cursor,
         } => {
-            let registry = ensure_sidecar(
-                &root,
-                &registry_path,
-                args.fff_mcp_bin.as_deref(),
-                args.no_start,
-            )?;
             let payload = json!({ "query": query, "maxResults": max_results, "cursor": cursor });
-            println!("{}", call_text(&registry, "find", "find_files", payload)?);
+            println!(
+                "{}",
+                call_text(
+                    &root,
+                    &registry_path,
+                    args.fff_mcp_bin.as_deref(),
+                    args.no_start,
+                    "find",
+                    "find_files",
+                    payload,
+                )?
+            );
         }
         Commands::Grep {
             query,
@@ -157,19 +162,24 @@ fn run() -> Result<()> {
             output_mode,
             cursor,
         } => {
-            let registry = ensure_sidecar(
-                &root,
-                &registry_path,
-                args.fff_mcp_bin.as_deref(),
-                args.no_start,
-            )?;
             let payload = json!({
                 "query": query,
                 "maxResults": max_results,
                 "output_mode": output_mode,
                 "cursor": cursor
             });
-            println!("{}", call_text(&registry, "grep", "grep", payload)?);
+            println!(
+                "{}",
+                call_text(
+                    &root,
+                    &registry_path,
+                    args.fff_mcp_bin.as_deref(),
+                    args.no_start,
+                    "grep",
+                    "grep",
+                    payload,
+                )?
+            );
         }
         Commands::MultiGrep {
             patterns,
@@ -182,12 +192,6 @@ fn run() -> Result<()> {
             if patterns.is_empty() {
                 return Err("multi-grep requires at least one pattern".into());
             }
-            let registry = ensure_sidecar(
-                &root,
-                &registry_path,
-                args.fff_mcp_bin.as_deref(),
-                args.no_start,
-            )?;
             let payload = json!({
                 "patterns": patterns,
                 "constraints": constraints,
@@ -198,21 +202,30 @@ fn run() -> Result<()> {
             });
             println!(
                 "{}",
-                call_text(&registry, "multi-grep", "multi_grep", payload)?
+                call_text(
+                    &root,
+                    &registry_path,
+                    args.fff_mcp_bin.as_deref(),
+                    args.no_start,
+                    "multi-grep",
+                    "multi_grep",
+                    payload,
+                )?
             );
         }
         Commands::Batch => {
-            let registry = ensure_sidecar(
-                &root,
-                &registry_path,
-                args.fff_mcp_bin.as_deref(),
-                args.no_start,
-            )?;
             let mut input = String::new();
             std::io::stdin().read_to_string(&mut input)?;
-            let response = http_post_json(&format!("{}/batch", registry.fffq_url), &input, &[])?;
-            ensure_success(&response)?;
-            print!("{}", response.body);
+            print!(
+                "{}",
+                call_batch(
+                    &root,
+                    &registry_path,
+                    args.fff_mcp_bin.as_deref(),
+                    args.no_start,
+                    &input,
+                )?
+            );
         }
     }
 
@@ -346,6 +359,75 @@ fn resolve_fff_mcp_bin(explicit: Option<&Path>) -> Result<PathBuf> {
 }
 
 fn call_text(
+    root: &str,
+    registry_path: &Path,
+    fff_mcp_bin: Option<&Path>,
+    no_start: bool,
+    direct_tool: &str,
+    mcp_tool: &str,
+    payload: serde_json::Value,
+) -> Result<String> {
+    let registry = ensure_sidecar(root, registry_path, fff_mcp_bin, no_start)?;
+    match call_text_once(&registry, direct_tool, mcp_tool, payload.clone()) {
+        Ok(text) => Ok(text),
+        Err(error) if !no_start && is_retryable_sidecar_error(&error.to_string()) => {
+            eprintln!("fffq: sidecar request failed ({error}); restarting sidecar once");
+            restart_sidecar(root, registry_path, fff_mcp_bin).and_then(|registry| {
+                call_text_once(&registry, direct_tool, mcp_tool, payload).map_err(|retry_error| {
+                    format!("{error}; retry after restarting sidecar also failed: {retry_error}")
+                        .into()
+                })
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn call_batch(
+    root: &str,
+    registry_path: &Path,
+    fff_mcp_bin: Option<&Path>,
+    no_start: bool,
+    input: &str,
+) -> Result<String> {
+    let registry = ensure_sidecar(root, registry_path, fff_mcp_bin, no_start)?;
+    match call_batch_once(&registry, input) {
+        Ok(body) => Ok(body),
+        Err(error) if !no_start && is_retryable_sidecar_error(&error.to_string()) => {
+            eprintln!("fffq: sidecar request failed ({error}); restarting sidecar once");
+            restart_sidecar(root, registry_path, fff_mcp_bin).and_then(|registry| {
+                call_batch_once(&registry, input).map_err(|retry_error| {
+                    format!("{error}; retry after restarting sidecar also failed: {retry_error}")
+                        .into()
+                })
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn restart_sidecar(
+    root: &str,
+    registry_path: &Path,
+    fff_mcp_bin: Option<&Path>,
+) -> Result<Registry> {
+    let _ = std::fs::remove_file(registry_path);
+    ensure_sidecar(root, registry_path, fff_mcp_bin, false)
+}
+
+fn is_retryable_sidecar_error(message: &str) -> bool {
+    message.contains("Connection refused")
+        || message.contains("connection refused")
+        || message.contains("Connection reset")
+        || message.contains("connection reset")
+        || message.contains("Broken pipe")
+        || message.contains("broken pipe")
+        || message.contains("timed out")
+        || message.contains("empty HTTP response from sidecar")
+        || message.contains("malformed HTTP response")
+}
+
+fn call_text_once(
     registry: &Registry,
     direct_tool: &str,
     mcp_tool: &str,
@@ -370,6 +452,12 @@ fn call_text(
             format!("direct fffq HTTP failed: {error}; streamable HTTP MCP fallback also failed: {fallback}").into()
         }),
     }
+}
+
+fn call_batch_once(registry: &Registry, input: &str) -> Result<String> {
+    let response = http_post_json(&format!("{}/batch", registry.fffq_url), input, &[])?;
+    ensure_success(&response)?;
+    Ok(response.body)
 }
 
 fn call_mcp_text(registry: &Registry, tool: &str, arguments: serde_json::Value) -> Result<String> {
@@ -508,6 +596,9 @@ fn parse_http_url(url: &str) -> Result<HttpUrl> {
 }
 
 fn parse_http_response(raw: &[u8]) -> Result<HttpResponse> {
+    if raw.is_empty() {
+        return Err("empty HTTP response from sidecar".into());
+    }
     let response = String::from_utf8_lossy(raw);
     let (head, body) = response
         .split_once("\r\n\r\n")
@@ -614,5 +705,24 @@ mod tests {
             extract_json_body(body).unwrap(),
             "{\"jsonrpc\":\"2.0\",\"id\":2}"
         );
+    }
+
+    #[test]
+    fn empty_http_response_is_reported_as_sidecar_failure() {
+        let error = parse_http_response(b"").unwrap_err().to_string();
+        assert_eq!(error, "empty HTTP response from sidecar");
+        assert!(is_retryable_sidecar_error(&error));
+    }
+
+    #[test]
+    fn retryable_sidecar_errors_match_observed_failure() {
+        let error = "direct fffq HTTP failed: malformed HTTP response; streamable HTTP MCP fallback also failed: Connection refused (os error 61)";
+        assert!(is_retryable_sidecar_error(error));
+    }
+
+    #[test]
+    fn http_status_errors_do_not_force_sidecar_restart() {
+        let error = "direct fffq HTTP returned 400; streamable HTTP MCP fallback also failed: MCP error: invalid request";
+        assert!(!is_retryable_sidecar_error(error));
     }
 }
