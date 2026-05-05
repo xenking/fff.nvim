@@ -16,6 +16,15 @@ exact text lookup, symbol-name lookup, and quick grep-style context.
    fffq ensure
    ```
 
+   If the user names a repo/path/module outside the current shell directory,
+   do not keep searching only from the broad current root. First locate the
+   target with `fffq find <name>` if needed, then switch to the target source
+   root with `fffq -C <target-path-or-repo> ensure` and run subsequent
+   `fffq -C <target-path-or-repo> ...` searches there. `fffq -C` resolves
+   nested git worktrees to their own repo root, so this avoids starting one
+   broad sidecar for a parent directory like `~/Projects/playground` when the
+   actual task is in a nested checkout.
+
 2. Use `fffq` before shell `find`, `grep`, `rg`, `sed`, or `awk` for repo search.
 
 3. Use repo-relative constraints where possible.
@@ -30,8 +39,10 @@ exact text lookup, symbol-name lookup, and quick grep-style context.
 
 ```bash
 fffq ensure
+fffq -C /path/to/target/repo ensure
 fffq doctor
 fffq find Cargo.toml -n 10
+fffq -C /path/to/target/repo grep SomeIdentifier -n 20
 fffq grep SomeIdentifier -n 20
 fffq grep SomeIdentifier --output-mode path -n 50
 fffq multi-grep SomeIdentifier some_identifier --constraints '*.rs' -n 20

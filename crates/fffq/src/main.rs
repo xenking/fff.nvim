@@ -12,6 +12,9 @@ use std::os::unix::process::CommandExt;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
+const SIDECAR_START_LOCK_WAIT: Duration = Duration::from_secs(20);
+const SIDECAR_START_LOCK_STALE_AFTER: Duration = Duration::from_secs(30);
+
 #[derive(Parser)]
 #[command(
     name = "fffq",
@@ -99,6 +102,23 @@ struct HttpUrl {
     host: String,
     port: u16,
     path: String,
+}
+
+#[derive(Debug)]
+struct SidecarStartLock {
+    path: PathBuf,
+}
+
+#[derive(Debug)]
+enum SidecarStartLockResult {
+    Acquired(SidecarStartLock),
+    Existing(Registry),
+}
+
+impl Drop for SidecarStartLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
 }
 
 fn main() {
@@ -256,6 +276,10 @@ fn registry_path(root: &str) -> PathBuf {
         .join(format!("{hash}.json"))
 }
 
+fn start_lock_path(registry_path: &Path) -> PathBuf {
+    registry_path.with_extension("lock")
+}
+
 fn ensure_sidecar(
     root: &str,
     registry_path: &Path,
@@ -273,10 +297,20 @@ fn ensure_sidecar(
         .into());
     }
 
-    let bin = resolve_fff_mcp_bin(fff_mcp_bin)?;
     if let Some(parent) = registry_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+
+    let _start_lock = match acquire_sidecar_start_lock(root, registry_path)? {
+        SidecarStartLockResult::Existing(registry) => return Ok(registry),
+        SidecarStartLockResult::Acquired(lock) => lock,
+    };
+
+    if let Some(registry) = read_live_registry(root, registry_path) {
+        return Ok(registry);
+    }
+
+    let bin = resolve_fff_mcp_bin(fff_mcp_bin)?;
     let _ = std::fs::remove_file(registry_path);
 
     let mut command = Command::new(&bin);
@@ -318,6 +352,62 @@ fn ensure_sidecar(
         registry_path.display()
     )
     .into())
+}
+
+fn acquire_sidecar_start_lock(root: &str, registry_path: &Path) -> Result<SidecarStartLockResult> {
+    let lock_path = start_lock_path(registry_path);
+    let deadline = Instant::now() + SIDECAR_START_LOCK_WAIT;
+
+    loop {
+        if let Some(registry) = read_live_registry(root, registry_path) {
+            return Ok(SidecarStartLockResult::Existing(registry));
+        }
+
+        match std::fs::create_dir(&lock_path) {
+            Ok(()) => {
+                let owner = json!({
+                    "pid": std::process::id(),
+                    "root": root,
+                    "created_at_ms": _system_time_ms(SystemTime::now()).ok(),
+                });
+                let _ = std::fs::write(lock_path.join("owner.json"), owner.to_string());
+                return Ok(SidecarStartLockResult::Acquired(SidecarStartLock {
+                    path: lock_path,
+                }));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if sidecar_start_lock_is_stale(&lock_path) {
+                    let _ = std::fs::remove_dir_all(&lock_path);
+                    continue;
+                }
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "timed out waiting for sidecar start lock {}; another fffq may be starting {root}",
+                        lock_path.display()
+                    )
+                    .into());
+                }
+                std::thread::sleep(Duration::from_millis(75));
+            }
+            Err(error) => {
+                return Err(format!(
+                    "failed to acquire sidecar start lock {}: {error}",
+                    lock_path.display()
+                )
+                .into());
+            }
+        }
+    }
+}
+
+fn sidecar_start_lock_is_stale(lock_path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(lock_path) else {
+        return true;
+    };
+    let Ok(modified) = metadata.modified() else {
+        return true;
+    };
+    modified.elapsed().unwrap_or(Duration::ZERO) > SIDECAR_START_LOCK_STALE_AFTER
 }
 
 fn read_live_registry(root: &str, registry_path: &Path) -> Option<Registry> {
@@ -688,6 +778,12 @@ mod tests {
             registry_path("/tmp/example").file_name().unwrap(),
             "f41a30cd85f04889.json"
         );
+    }
+
+    #[test]
+    fn start_lock_path_is_per_registry_root() {
+        let lock_path = start_lock_path(&registry_path("/tmp/example"));
+        assert_eq!(lock_path.file_name().unwrap(), "f41a30cd85f04889.lock");
     }
 
     #[test]
