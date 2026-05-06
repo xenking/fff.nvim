@@ -18,12 +18,19 @@ exact text lookup, symbol-name lookup, and quick grep-style context.
 
 2. Prefer `fffq find`, `fffq grep`, and `fffq multi-grep` before shell search.
 
-3. Use repo-relative constraints where possible.
+3. When searching for several exact terms in the same root, prefer one
+   `fffq multi-grep term1 term2 ...` call over repeated
+   `fffq grep term1 || true; fffq grep term2 || true; ...`. Use separate
+   `grep` calls only when each term needs different constraints/output, or when
+   independent per-term ranking/absence is important. Do not add `|| true`
+   unless masking a non-zero exit is explicitly intended and explained.
 
-4. Do not rely on stdio MCP for normal FFF usage. `fffq` starts/reuses a
+4. Use repo-relative constraints where possible.
+
+5. Do not rely on stdio MCP for normal FFF usage. `fffq` starts/reuses a
    per-project `fff-mcp --transport streamable-http` sidecar.
 
-5. If FFF is unavailable, stale, or outside the current root, report that and
+6. If FFF is unavailable, stale, or outside the current root, report that and
    fall back honestly.
 
 ## Commands
@@ -34,6 +41,7 @@ fffq doctor
 fffq find Cargo.toml -n 10
 fffq grep SomeIdentifier -n 20
 fffq grep SomeIdentifier --output-mode path -n 50
+fffq multi-grep MemoryBank claurst omx codex -n 50
 fffq multi-grep SomeIdentifier some_identifier --constraints '*.rs' -n 20
 fffq multi-grep foo bar baz --constraints 'src/**/*.ts' --context 2 -n 50
 ```
