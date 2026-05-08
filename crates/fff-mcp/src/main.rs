@@ -341,12 +341,18 @@ struct FffqBatchResponse {
 
 #[derive(serde::Serialize)]
 struct SidecarRegistry {
+    schema_version: u32,
     root: String,
     pid: u32,
+    ppid: u32,
+    pgid: u32,
     http_url: String,
     mcp_url: String,
     fffq_url: String,
     started_at_ms: u128,
+    last_used_at_ms: u128,
+    launcher: String,
+    registry_path: String,
 }
 
 fn fffq_error(error: rmcp::model::ErrorData) -> (StatusCode, Json<FffqError>) {
@@ -475,18 +481,47 @@ fn write_sidecar_registry(
         std::fs::create_dir_all(parent)?;
     }
     let http_url = format!("http://{local_addr}");
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis();
     let registry = SidecarRegistry {
+        schema_version: 2,
         root: root.to_string(),
         pid: std::process::id(),
+        ppid: parent_pid(),
+        pgid: process_group_id(),
         mcp_url: format!("{http_url}{http_path}"),
         fffq_url: format!("{http_url}/fffq"),
         http_url,
-        started_at_ms: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_millis(),
+        started_at_ms: now_ms,
+        last_used_at_ms: now_ms,
+        launcher: std::env::var("FFF_MCP_LAUNCHER").unwrap_or_else(|_| "fff-mcp".to_string()),
+        registry_path: registry_path.to_string_lossy().to_string(),
     };
     std::fs::write(&registry_path, serde_json::to_vec_pretty(&registry)?)?;
     Ok(registry_path)
+}
+
+#[cfg(unix)]
+fn parent_pid() -> u32 {
+    // SAFETY: getppid has no preconditions and does not mutate Rust-managed memory.
+    unsafe { libc::getppid().max(0) as u32 }
+}
+
+#[cfg(not(unix))]
+fn parent_pid() -> u32 {
+    0
+}
+
+#[cfg(unix)]
+fn process_group_id() -> u32 {
+    // SAFETY: getpgrp has no preconditions and does not mutate Rust-managed memory.
+    unsafe { libc::getpgrp().max(0) as u32 }
+}
+
+#[cfg(not(unix))]
+fn process_group_id() -> u32 {
+    0
 }
 
 fn build_streamable_http_router(
@@ -932,6 +967,24 @@ mod tests {
         assert_eq!(
             registry.get("fffq_url").and_then(|value| value.as_str()),
             Some("http://127.0.0.1:54321/fffq")
+        );
+        assert_eq!(
+            registry
+                .get("schema_version")
+                .and_then(|value| value.as_u64()),
+            Some(2)
+        );
+        assert_eq!(
+            registry
+                .get("registry_path")
+                .and_then(|value| value.as_str()),
+            Some(registry_path.to_string_lossy().as_ref())
+        );
+        assert!(
+            registry
+                .get("last_used_at_ms")
+                .and_then(|value| value.as_u64())
+                .is_some()
         );
 
         std::fs::remove_dir_all(temp_repo).ok();

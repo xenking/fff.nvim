@@ -14,6 +14,8 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 const SIDECAR_START_LOCK_WAIT: Duration = Duration::from_secs(20);
 const SIDECAR_START_LOCK_STALE_AFTER: Duration = Duration::from_secs(30);
+const DEFAULT_CLEANUP_MAX_IDLE_SECS: u64 = 60 * 60;
+const SIDECAR_REGISTRY_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Parser)]
 #[command(
@@ -78,16 +80,37 @@ enum Commands {
     },
     /// Send a JSON batch request to /fffq/batch. Reads JSON from stdin.
     Batch,
+    /// Remove dead registry files and terminate idle fffq-managed sidecars.
+    Cleanup {
+        /// Show what would be removed/killed without changing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Terminate fffq-managed sidecars idle for at least this many seconds.
+        #[arg(long = "max-idle-secs", default_value_t = DEFAULT_CLEANUP_MAX_IDLE_SECS)]
+        max_idle_secs: u64,
+    },
 }
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 struct Registry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    schema_version: Option<u32>,
     root: String,
     pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ppid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pgid: Option<u32>,
     http_url: String,
     mcp_url: String,
     fffq_url: String,
     started_at_ms: u128,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_used_at_ms: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    launcher: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    registry_path: Option<String>,
 }
 
 #[derive(Debug)]
@@ -247,6 +270,12 @@ fn run() -> Result<()> {
                 )?
             );
         }
+        Commands::Cleanup {
+            dry_run,
+            max_idle_secs,
+        } => {
+            cleanup_sidecars(dry_run, Duration::from_secs(max_idle_secs))?;
+        }
     }
 
     Ok(())
@@ -266,14 +295,21 @@ fn resolve_root(cwd: Option<&Path>) -> Result<String> {
     }
 }
 
-fn registry_path(root: &str) -> PathBuf {
+fn sidecars_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    let hash = blake3::hash(root.as_bytes()).to_hex()[..16].to_string();
     PathBuf::from(home)
         .join(".cache")
         .join("fff")
         .join("sidecars")
-        .join(format!("{hash}.json"))
+}
+
+fn sidecar_hash(root: &str) -> String {
+    blake3::hash(root.as_bytes()).to_hex()[..16].to_string()
+}
+
+fn registry_path(root: &str) -> PathBuf {
+    let hash = sidecar_hash(root);
+    sidecars_dir().join(format!("{hash}.json"))
 }
 
 fn start_lock_path(registry_path: &Path) -> PathBuf {
@@ -316,6 +352,7 @@ fn ensure_sidecar(
     let mut command = Command::new(&bin);
     command
         .current_dir(root)
+        .env("FFF_MCP_LAUNCHER", "fffq")
         .arg("--transport")
         .arg("streamable-http")
         .arg("--http-bind")
@@ -412,7 +449,7 @@ fn sidecar_start_lock_is_stale(lock_path: &Path) -> bool {
 
 fn read_live_registry(root: &str, registry_path: &Path) -> Option<Registry> {
     let raw = std::fs::read_to_string(registry_path).ok()?;
-    let registry: Registry = serde_json::from_str(&raw).ok()?;
+    let mut registry: Registry = serde_json::from_str(&raw).ok()?;
     if registry.root != root {
         return None;
     }
@@ -423,7 +460,17 @@ fn read_live_registry(root: &str, registry_path: &Path) -> Option<Registry> {
     if health.get("root").and_then(|v| v.as_str()) != Some(root) {
         return None;
     }
+    touch_registry_last_used(registry_path, &mut registry).ok()?;
     Some(registry)
+}
+
+fn touch_registry_last_used(registry_path: &Path, registry: &mut Registry) -> Result<()> {
+    registry.schema_version = Some(SIDECAR_REGISTRY_SCHEMA_VERSION);
+    registry.last_used_at_ms = Some(_system_time_ms(SystemTime::now())?);
+    registry.launcher.get_or_insert_with(|| "fffq".to_string());
+    registry.registry_path = Some(registry_path.to_string_lossy().to_string());
+    std::fs::write(registry_path, serde_json::to_vec_pretty(registry)?)?;
+    Ok(())
 }
 
 fn resolve_fff_mcp_bin(explicit: Option<&Path>) -> Result<PathBuf> {
@@ -503,6 +550,179 @@ fn restart_sidecar(
 ) -> Result<Registry> {
     let _ = std::fs::remove_file(registry_path);
     ensure_sidecar(root, registry_path, fff_mcp_bin, false)
+}
+
+fn cleanup_sidecars(dry_run: bool, max_idle: Duration) -> Result<()> {
+    let sidecars_dir = sidecars_dir();
+    let now_ms = _system_time_ms(SystemTime::now())?;
+    let mut removed_dead = 0_usize;
+    let mut terminated_idle = 0_usize;
+    let mut skipped = 0_usize;
+
+    if !sidecars_dir.exists() {
+        println!(
+            "No fff sidecar cache directory found at {}",
+            sidecars_dir.display()
+        );
+        return Ok(());
+    }
+
+    for entry in std::fs::read_dir(&sidecars_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            skipped += 1;
+            continue;
+        };
+        let Ok(registry) = serde_json::from_str::<Registry>(&raw) else {
+            skipped += 1;
+            continue;
+        };
+
+        if !pid_is_alive(registry.pid) {
+            println!(
+                "{} dead registry for pid {} root {}: {}",
+                if dry_run { "Would remove" } else { "Removing" },
+                registry.pid,
+                registry.root,
+                path.display()
+            );
+            if !dry_run {
+                std::fs::remove_file(&path)?;
+            }
+            removed_dead += 1;
+            continue;
+        }
+
+        let Some(idle) = registry_idle_duration(now_ms, &registry) else {
+            skipped += 1;
+            continue;
+        };
+        if idle < max_idle {
+            skipped += 1;
+            continue;
+        }
+        if !is_cleanup_managed_sidecar(&registry, &path) {
+            skipped += 1;
+            continue;
+        }
+        if !process_command_matches_managed_sidecar(registry.pid, &path)? {
+            skipped += 1;
+            continue;
+        }
+
+        let idle_secs = idle.as_secs();
+        println!(
+            "{} idle sidecar pid {} idle {}s root {}: {}",
+            if dry_run {
+                "Would terminate"
+            } else {
+                "Terminating"
+            },
+            registry.pid,
+            idle_secs,
+            registry.root,
+            path.display()
+        );
+        if !dry_run {
+            terminate_pid(registry.pid)?;
+            std::fs::remove_file(&path).ok();
+        }
+        terminated_idle += 1;
+    }
+
+    println!(
+        "{}: {} dead registry file(s), {} idle sidecar(s), {} skipped.",
+        if dry_run { "Dry run" } else { "Cleanup" },
+        removed_dead,
+        terminated_idle,
+        skipped
+    );
+
+    Ok(())
+}
+
+fn registry_idle_duration(now_ms: u128, registry: &Registry) -> Option<Duration> {
+    let last_used = registry.last_used_at_ms.or(Some(registry.started_at_ms))?;
+    if now_ms < last_used {
+        return Some(Duration::ZERO);
+    }
+    let idle_ms = now_ms - last_used;
+    let idle_ms = idle_ms.min(u64::MAX as u128) as u64;
+    Some(Duration::from_millis(idle_ms))
+}
+
+fn is_cleanup_managed_sidecar(registry: &Registry, path: &Path) -> bool {
+    registry.schema_version == Some(SIDECAR_REGISTRY_SCHEMA_VERSION)
+        && registry.launcher.as_deref() == Some("fffq")
+        && registry
+            .registry_path
+            .as_deref()
+            .is_some_and(|registry_path| Path::new(registry_path) == path)
+}
+
+fn process_command_matches_managed_sidecar(pid: u32, registry_path: &Path) -> Result<bool> {
+    let output = Command::new("ps")
+        .arg("-ww")
+        .arg("-p")
+        .arg(pid.to_string())
+        .arg("-o")
+        .arg("command=")
+        .output()?;
+    if !output.status.success() {
+        return Ok(false);
+    }
+    let command = String::from_utf8_lossy(&output.stdout);
+    Ok(command.contains("fff-mcp")
+        && command.contains("--transport")
+        && command.contains("streamable-http")
+        && command.contains("--registry-path")
+        && command.contains(&registry_path.to_string_lossy().to_string()))
+}
+
+#[cfg(unix)]
+fn pid_is_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    // SAFETY: kill(pid, 0) only checks signal delivery; it does not signal the process.
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+#[cfg(not(unix))]
+fn pid_is_alive(_pid: u32) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn terminate_pid(pid: u32) -> Result<()> {
+    if pid == 0 {
+        return Ok(());
+    }
+    // SAFETY: sending SIGTERM/SIGKILL to a validated process id.
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGTERM);
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if !pid_is_alive(pid) {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // SAFETY: escalation for a process that stayed alive after SIGTERM.
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn terminate_pid(_pid: u32) -> Result<()> {
+    Ok(())
 }
 
 fn is_retryable_sidecar_error(message: &str) -> bool {
@@ -784,6 +1004,67 @@ mod tests {
     fn start_lock_path_is_per_registry_root() {
         let lock_path = start_lock_path(&registry_path("/tmp/example"));
         assert_eq!(lock_path.file_name().unwrap(), "f41a30cd85f04889.lock");
+    }
+
+    #[test]
+    fn cleanup_only_manages_schema_v2_fffq_registries_with_matching_path() {
+        let path = PathBuf::from("/tmp/fff-sidecar.json");
+        let mut registry = Registry {
+            schema_version: Some(SIDECAR_REGISTRY_SCHEMA_VERSION),
+            root: "/tmp/example".to_string(),
+            pid: 123,
+            ppid: Some(1),
+            pgid: Some(123),
+            http_url: "http://127.0.0.1:12345".to_string(),
+            mcp_url: "http://127.0.0.1:12345/mcp".to_string(),
+            fffq_url: "http://127.0.0.1:12345/fffq".to_string(),
+            started_at_ms: 100,
+            last_used_at_ms: Some(200),
+            launcher: Some("fffq".to_string()),
+            registry_path: Some(path.to_string_lossy().to_string()),
+        };
+
+        assert!(is_cleanup_managed_sidecar(&registry, &path));
+
+        registry.launcher = Some("fff-mcp".to_string());
+        assert!(!is_cleanup_managed_sidecar(&registry, &path));
+
+        registry.launcher = Some("fffq".to_string());
+        registry.registry_path = Some("/tmp/other.json".to_string());
+        assert!(!is_cleanup_managed_sidecar(&registry, &path));
+
+        registry.registry_path = Some(path.to_string_lossy().to_string());
+        registry.schema_version = None;
+        assert!(!is_cleanup_managed_sidecar(&registry, &path));
+    }
+
+    #[test]
+    fn registry_idle_duration_uses_last_used_with_started_fallback() {
+        let mut registry = Registry {
+            schema_version: Some(SIDECAR_REGISTRY_SCHEMA_VERSION),
+            root: "/tmp/example".to_string(),
+            pid: 123,
+            ppid: None,
+            pgid: None,
+            http_url: "http://127.0.0.1:12345".to_string(),
+            mcp_url: "http://127.0.0.1:12345/mcp".to_string(),
+            fffq_url: "http://127.0.0.1:12345/fffq".to_string(),
+            started_at_ms: 1_000,
+            last_used_at_ms: Some(2_000),
+            launcher: Some("fffq".to_string()),
+            registry_path: Some("/tmp/fff-sidecar.json".to_string()),
+        };
+
+        assert_eq!(
+            registry_idle_duration(5_500, &registry),
+            Some(Duration::from_millis(3_500))
+        );
+
+        registry.last_used_at_ms = None;
+        assert_eq!(
+            registry_idle_duration(5_500, &registry),
+            Some(Duration::from_millis(4_500))
+        );
     }
 
     #[test]

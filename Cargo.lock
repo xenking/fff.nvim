@@ -746,6 +746,7 @@ dependencies = [
  "fff-query-parser",
  "fff-search",
  "git2",
+ "libc",
  "mimalloc",
  "rmcp",
  "schemars",
@@ -868,6 +869,7 @@ dependencies = [
  "blake3",
  "clap",
  "git2",
+ "libc",
  "serde",
  "serde_json",
 ]

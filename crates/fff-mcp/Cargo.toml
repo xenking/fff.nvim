@@ -28,3 +28,4 @@ tracing = { workspace = true }
 git2 = { workspace = true }
 clap = { version = "4", features = ["derive", "env"] }
 blake3 = { workspace = true }
+libc = "0.2"

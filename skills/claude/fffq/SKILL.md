@@ -44,7 +44,14 @@ fffq grep SomeIdentifier --output-mode path -n 50
 fffq multi-grep MemoryBank claurst omx codex -n 50
 fffq multi-grep SomeIdentifier some_identifier --constraints '*.rs' -n 20
 fffq multi-grep foo bar baz --constraints 'src/**/*.ts' --context 2 -n 50
+fffq cleanup --dry-run
+fffq cleanup --max-idle-secs 3600
 ```
+
+Use `fffq cleanup --dry-run` before manual cleanup. It removes dead registry
+files and only terminates idle sidecars that are explicitly marked as
+`launcher: "fffq"` in `~/.cache/fff/sidecars/*.json`; it is not a generic
+process-name killer.
 
 ## When to use shell fallback
 
